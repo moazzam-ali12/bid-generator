@@ -1,4 +1,4 @@
-#!/home/sarmad/Documents/automation/northlake_qwen_automation/venv/bin/python3
+#!/home/sarmad/Documents/automation/bid-generator/venv/bin/python3
 # -*- coding: utf-8 -*-
 import re
 import sys
