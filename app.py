@@ -24,20 +24,20 @@ from extract import (
     KEYWORDS_PROMPT_3,
 )
 from prompts import (
+    prompt_0_cover_page,
     prompt_1_table1,
     prompt_2_table2,
-    prompt_3_tables3_4_5,
-    prompt_4_tables6_7,
-    prompt_5_tables8_9_10,
+    prompt_3_table3,
+    prompt_final_quantities,
 )
 from openai_client import OpenAIClient, OpenAIConfig
-from excel_writer import build_workbook, build_workbook_v2
+from excel_writer import build_workbook_v2
 
 load_dotenv()
 
 MAX_REFINEMENTS = 3
 
-app = FastAPI(title="Northlake Bid Excel Generator", version="0.3.0")
+app = FastAPI(title="Northlake Bid Excel Generator", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,10 +50,11 @@ app.add_middleware(
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
+
 def _cfg() -> OpenAIConfig:
-    api_key  = os.getenv("OPENAI_API_KEY",  "").strip()
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
     base_url = os.getenv("OPENAI_BASE_URL", "").strip()
-    model    = os.getenv("OPENAI_MODEL",    "").strip()
+    model = os.getenv("OPENAI_MODEL", "").strip()
     if not api_key or not base_url or not model:
         raise RuntimeError(
             "Missing OPENAI_API_KEY, OPENAI_BASE_URL, or OPENAI_MODEL in environment/.env"
@@ -63,12 +64,13 @@ def _cfg() -> OpenAIConfig:
         base_url=base_url,
         model=model,
         temperature=float(os.getenv("TEMPERATURE", "0.1")),
-        max_tokens=int(os.getenv("MAX_TOKENS", "4000")),
+        max_tokens=int(os.getenv("MAX_TOKENS", "16000")),
         timeout_s=600.0,
     )
 
 
 # ─── Document Ingestion ───────────────────────────────────────────────────────
+
 
 def _ingest(files: List[UploadFile]) -> List[IngestedDoc]:
     docs: List[IngestedDoc] = []
@@ -96,41 +98,55 @@ def _maybe_filter(
         return docs
     out = []
     for d in docs:
-        filtered = keyword_window(d.text, keywords=keywords, window_lines=4, max_chars=60_000)
+        filtered = keyword_window(
+            d.text, keywords=keywords, window_lines=4, max_chars=60_000
+        )
         if not filtered.strip():
             filtered = d.text[:30_000]
         out.append(IngestedDoc(filename=d.filename, text=filtered))
     return out
 
 
-# ─── JSON Cleaner ─────────────────────────────────────────────────────────────
+# ─── JSON Helpers ─────────────────────────────────────────────────────────────
+
+
+def _repair_json(text: str) -> str:
+    """Fix common GPT JSON formatting mistakes before parsing."""
+    # Remove trailing commas before } or ]
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    # Fix comma-formatted numbers inside JSON values e.g. 181,000 → 181000
+    # Only targets numbers like 181,000 or 1,234,567 (not commas between keys)
+    text = re.sub(r"(\d),(\d{3})(?=\s*[,\}\]\n])", r"\1\2", text)
+    # Replace Python literals with JSON equivalents
+    text = re.sub(r"\bNone\b", "null", text)
+    text = re.sub(r"\bTrue\b", "true", text)
+    text = re.sub(r"\bFalse\b", "false", text)
+    return text
+
+
+def _is_truncated(text: str) -> bool:
+    """Detect if GPT response was cut off mid-JSON."""
+    opens = text.count("{") + text.count("[")
+    closes = text.count("}") + text.count("]")
+    return opens > closes
+
 
 def _clean_json(raw: str) -> str:
-    """
-    Strip markdown fences and any leading/trailing noise GPT adds
-    despite being told not to. Handles all common cases:
-      - ```json ... ```
-      - ``` ... ```
-      - Explanation text before the first { or [
-      - Trailing text after the last } or ]
-    """
+    """Strip markdown fences and leading/trailing noise, then repair common GPT JSON mistakes."""
     text = raw.strip()
-    # Remove opening fence
     text = re.sub(r"^```(?:json)?\s*", "", text)
-    # Remove closing fence
     text = re.sub(r"\s*```$", "", text)
-    # Find first JSON character
     match = re.search(r"[\[\{]", text)
     if match:
-        text = text[match.start():]
-    # Trim trailing noise after last } or ]
+        text = text[match.start() :]
     last = max(text.rfind("}"), text.rfind("]"))
     if last != -1:
-        text = text[:last + 1]
-    return text.strip()
+        text = text[: last + 1]
+    return _repair_json(text.strip())
 
 
 # ─── JSON Parse + Retry ───────────────────────────────────────────────────────
+
 
 async def _parse_json_or_retry_async(
     client: OpenAIClient,
@@ -140,16 +156,28 @@ async def _parse_json_or_retry_async(
 ) -> Dict[str, Any]:
     last = None
     for attempt in range(retries + 1):
-        raw  = await asyncio.to_thread(client.chat_json, system=system, user=user)
+        raw = await asyncio.to_thread(client.chat_json, system=system, user=user)
         last = raw
+
+        if _is_truncated(_clean_json(raw)):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "TRUNCATED: Model response was cut off mid-JSON. "
+                    "Increase MAX_TOKENS in your .env (current default: 16000)."
+                ),
+            )
+
         try:
             return json.loads(_clean_json(raw))
         except Exception:
             if attempt >= retries:
                 raise HTTPException(
                     status_code=502,
-                    detail=f"Model did not return valid JSON after {retries + 1} attempts. "
-                           f"Last response: {raw[:500]}",
+                    detail=(
+                        f"Model did not return valid JSON after {retries + 1} attempts. "
+                        f"Last response: {raw[:500]}"
+                    ),
                 )
             user = (
                 "Your previous response was not valid JSON.\n"
@@ -164,6 +192,7 @@ async def _parse_json_or_retry_async(
 
 
 # ─── Pydantic models ─────────────────────────────────────────────────────────
+
 
 class RefinementMessage(BaseModel):
     role: str
@@ -180,11 +209,12 @@ class RefineRequest(BaseModel):
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
+
 @app.get("/")
 def root():
     return {
         "message": "Northlake Bid Excel Generator API",
-        "version": "0.3.0",
+        "version": "0.5.0",
         "docs": "/docs",
         "health": "/health",
     }
@@ -195,64 +225,17 @@ def health():
     return {"ok": True, "status": "running"}
 
 
-# ── Original endpoint — kept for backwards compatibility ──────────────────────
+# ── V2 endpoint — Cover Page + Tables 1-3 + Quantities ───────────────────────
 
-@app.post("/generate-bid-excel")
-async def generate_bid_excel(
-    files: List[UploadFile] = File(...),
-    project_name: str = Form("Northlake 7-Eleven"),
-):
-    try:
-        cfg = _cfg()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    disable_filter = os.getenv("DISABLE_KEYWORD_FILTER", "false").strip().lower() in (
-        "1", "true", "yes", "y"
-    )
-
-    docs_full = _ingest(files)
-    doc_list  = [d.filename for d in docs_full]
-    client    = OpenAIClient(cfg)
-
-    docs1 = _maybe_filter(docs_full, KEYWORDS_PROMPT_1, disable_filter)
-    ctx1  = build_context(docs1)
-    p1    = prompt_1_table1(project_name, doc_list)
-    user1 = p1["user"] + "\n\nDOCUMENT CONTEXT:\n" + ctx1
-
-    docs2 = _maybe_filter(docs_full, KEYWORDS_PROMPT_2, disable_filter)
-    ctx2  = build_context(docs2)
-    p2    = prompt_2_table2(project_name, doc_list)
-    user2 = p2["user"] + "\n\nDOCUMENT CONTEXT:\n" + ctx2
-
-    docs3 = _maybe_filter(docs_full, KEYWORDS_PROMPT_3, disable_filter)
-    ctx3  = build_context(docs3)
-    p3    = prompt_3_tables3_4_5(project_name, doc_list)
-    user3 = p3["user"] + "\n\nDOCUMENT CONTEXT:\n" + ctx3
-
-    print("Starting parallel API calls (original endpoint)...")
-    out1, out2, out3 = await asyncio.gather(
-        _parse_json_or_retry_async(client, p1["system"], user1, retries=1),
-        _parse_json_or_retry_async(client, p2["system"], user2, retries=1),
-        _parse_json_or_retry_async(client, p3["system"], user3, retries=1),
-    )
-    print("All API calls completed!")
-
-    xlsx_bytes = build_workbook(out1, out2, out3)
-    filename   = f"{project_name.replace(' ', '_')}_Bid_Tables.xlsx"
-    return Response(
-        content=xlsx_bytes,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
-
-
-# ── V2 endpoint — all 10 tables, returns JSON + base64 Excel for chat UI ─────
 
 @app.post("/generate-bid-excel-v2")
 async def generate_bid_excel_v2(
     files: List[UploadFile] = File(...),
     project_name: str = Form("Northlake Project"),
+    user_name: str = Form(""),
+    user_company: str = Form(""),
+    user_phone: str = Form(""),
+    user_email: str = Form(""),
 ):
     try:
         cfg = _cfg()
@@ -260,72 +243,73 @@ async def generate_bid_excel_v2(
         raise HTTPException(status_code=500, detail=str(e))
 
     disable_filter = os.getenv("DISABLE_KEYWORD_FILTER", "false").strip().lower() in (
-        "1", "true", "yes", "y"
+        "1",
+        "true",
+        "yes",
+        "y",
     )
 
-    docs_full    = _ingest(files)
-    doc_list     = [d.filename for d in docs_full]
-    client       = OpenAIClient(cfg)
-    full_context = build_context(
-        _maybe_filter(docs_full, [], disable_filter)
+    user_info = {
+        "name": user_name,
+        "company": user_company,
+        "phone": user_phone,
+        "email": user_email,
+    }
+
+    docs_full = _ingest(files)
+    doc_list = [d.filename for d in docs_full]
+    client = OpenAIClient(cfg)
+    full_context = build_context(_maybe_filter(docs_full, [], disable_filter))
+
+    # Build all 5 prompts
+    p0 = prompt_0_cover_page(user_info, project_name, doc_list)
+    p1 = prompt_1_table1(user_info, project_name, doc_list)
+    p2 = prompt_2_table2(user_info, project_name, doc_list)
+    p3 = prompt_3_table3(user_info, project_name, doc_list)
+    pf = prompt_final_quantities(user_info, project_name, doc_list)
+
+    ctx = "\n\nDOCUMENT CONTEXT:\n" + full_context
+
+    print("Starting parallel extraction (Cover Page + Tables 1-3 + Quantities)...")
+    out0, out1, out2, out3, outf = await asyncio.gather(
+        _parse_json_or_retry_async(client, p0["system"], p0["user"] + ctx, retries=1),
+        _parse_json_or_retry_async(client, p1["system"], p1["user"] + ctx, retries=1),
+        _parse_json_or_retry_async(client, p2["system"], p2["user"] + ctx, retries=1),
+        _parse_json_or_retry_async(client, p3["system"], p3["user"] + ctx, retries=1),
+        _parse_json_or_retry_async(client, pf["system"], pf["user"] + ctx, retries=1),
     )
-
-    p1 = prompt_1_table1(project_name, doc_list)
-    p2 = prompt_2_table2(project_name, doc_list)
-    p3 = prompt_3_tables3_4_5(project_name, doc_list)
-    p4 = prompt_4_tables6_7(project_name, doc_list)
-    p5 = prompt_5_tables8_9_10(project_name, doc_list)
-
-    u1 = p1["user"] + "\n" + full_context
-    u2 = p2["user"] + "\n" + full_context
-    u3 = p3["user"] + "\n" + full_context
-    u4 = p4["user"] + "\n" + full_context
-    u5 = p5["user"] + "\n" + full_context
-
-    print("Starting parallel extraction for all 10 tables...")
-    out1, out2, out3, out4, out5 = await asyncio.gather(
-        _parse_json_or_retry_async(client, p1["system"], u1, retries=1),
-        _parse_json_or_retry_async(client, p2["system"], u2, retries=1),
-        _parse_json_or_retry_async(client, p3["system"], u3, retries=1),
-        _parse_json_or_retry_async(client, p4["system"], u4, retries=1),
-        _parse_json_or_retry_async(client, p5["system"], u5, retries=1),
-    )
-    print("All 10 tables extracted successfully!")
+    print("All extractions completed!")
 
     all_tables = {
-        "meta":    out1.get("meta",    {}),
-        "header":  out1.get("header",  {}),
-        "table1":  out1.get("table1",  {}),
-        "table2":  out2.get("table2",  {}),
-        "table3":  out3.get("table3",  {}),
-        "table4":  out3.get("table4",  {}),
-        "table5":  out3.get("table5",  {}),
-        "table6":  out4.get("table6",  {}),
-        "table7":  out4.get("table7",  {}),
-        "table8":  out5.get("table8",  {}),
-        "table9":  out5.get("table9",  {}),
-        "table10": out5.get("table10", {}),
+        "meta": out1.get("meta", {}),
+        "header": out1.get("header", {}),
+        "cover_page": out0.get("cover_page", {}),
+        "table1": out1.get("table1", {}),
+        "table2": out2.get("table2", {}),
+        "table3": out3.get("table3", {}),
+        "quantity_estimation": outf.get("quantity_estimation", {}),
         "assumptions_or_gaps": (
-            out1.get("assumptions_or_gaps", [])
+            out0.get("assumptions_or_gaps", [])
+            + out1.get("assumptions_or_gaps", [])
             + out2.get("assumptions_or_gaps", [])
             + out3.get("assumptions_or_gaps", [])
-            + out4.get("assumptions_or_gaps", [])
-            + out5.get("assumptions_or_gaps", [])
+            + outf.get("assumptions_or_gaps", [])
         ),
     }
 
     xlsx_bytes = build_workbook_v2(all_tables)
-    filename   = f"{project_name.replace(' ', '_')}_Inspection_Testing_Summary.xlsx"
+    filename = f"{project_name.replace(' ', '_')}_Inspection_Testing_Summary.xlsx"
 
     return {
-        "extraction":       all_tables,
+        "extraction": all_tables,
         "document_context": full_context[:30000],
-        "excel_base64":     base64.b64encode(xlsx_bytes).decode(),
-        "filename":         filename,
+        "excel_base64": base64.b64encode(xlsx_bytes).decode(),
+        "filename": filename,
     }
 
 
 # ── Refinement / chat endpoint ────────────────────────────────────────────────
+
 
 @app.post("/refine-extraction")
 async def refine_extraction(req: RefineRequest):
@@ -362,17 +346,14 @@ Document context (for reference):
     )
     flat_user = (history_text + f"\n\n[USER]: {req.user_message}").strip()
 
-    # First attempt
     raw = await asyncio.to_thread(client.chat_json, system=system, user=flat_user)
     try:
         updated = json.loads(_clean_json(raw))
     except json.JSONDecodeError:
-        # One automatic retry with stronger instruction
         retry_user = (
             "Your response was not valid JSON. "
             "Return ONLY the JSON object. No markdown. No explanation. "
-            "Start with { and end with }.\n\n"
-            + flat_user
+            "Start with { and end with }.\n\n" + flat_user
         )
         raw2 = await asyncio.to_thread(client.chat_json, system=system, user=retry_user)
         try:
@@ -380,15 +361,14 @@ Document context (for reference):
         except json.JSONDecodeError:
             raise HTTPException(
                 status_code=502,
-                detail=f"Model returned invalid JSON during refinement. "
-                       f"Response preview: {raw2[:300]}",
+                detail=f"Model returned invalid JSON during refinement. Preview: {raw2[:300]}",
             )
 
     xlsx_bytes = build_workbook_v2(updated)
 
     return {
-        "extraction":            updated,
-        "excel_base64":          base64.b64encode(xlsx_bytes).decode(),
-        "refinements_used":      user_turns + 1,
+        "extraction": updated,
+        "excel_base64": base64.b64encode(xlsx_bytes).decode(),
+        "refinements_used": user_turns + 1,
         "refinements_remaining": MAX_REFINEMENTS - (user_turns + 1),
     }

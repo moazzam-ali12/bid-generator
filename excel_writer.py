@@ -3,161 +3,22 @@ from __future__ import annotations
 from typing import Dict, Any, List
 from io import BytesIO
 
-import pandas as pd
 from openpyxl import Workbook
-from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 
-# ── Config ────────────────────────────────────────────────────────────────────
-SPLIT_TABLES_TO_TABS = False
-
-# Paige Engineering brand colours
-NAVY = "1E3347"
-ORANGE = "D4721A"
-WHITE = "FFFFFF"
+# ── Brand colours ─────────────────────────────────────────────────────────────
+NAVY      = "1E3347"
+ORANGE    = "D4721A"
+WHITE     = "FFFFFF"
 ROW_LIGHT = "F4F6F9"
-BORDER_C = "DDE3EC"
+BORDER_C  = "DDE3EC"
+SECTION_BG = "EEF1F5"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ORIGINAL HELPERS (unchanged — kept so build_workbook still works)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _write_heading(ws: Worksheet, meta: Dict[str, Any], start_row: int = 1) -> int:
-    ws.cell(
-        row=start_row, column=1, value=f"Generated: {meta.get('generated_date','')}"
-    ).font = Font(bold=True)
-    ws.cell(
-        row=start_row + 1, column=1, value=f"Created by: {meta.get('created_by','')}"
-    ).font = Font(bold=True)
-    return start_row + 3
-
-
-def _autosize(ws: Worksheet, max_width: int = 70):
-    for col in ws.columns:
-        max_len = 0
-        col_letter = col[0].column_letter
-        for cell in col:
-            v = cell.value
-            if v is None:
-                continue
-            if len(str(v)) > max_len:
-                max_len = len(str(v))
-        ws.column_dimensions[col_letter].width = min(max(12, max_len + 2), max_width)
-
-
-def _sanitize_for_excel(val: Any) -> Any:
-    if isinstance(val, list):
-        return "\n".join(str(v) for v in val)
-    if isinstance(val, dict):
-        return str(val)
-    if val is None:
-        return ""
-    return val
-
-
-def _write_table(
-    ws: Worksheet,
-    title: str,
-    columns: List[str],
-    rows: List[Dict[str, Any]],
-    start_row: int,
-) -> int:
-    ws.cell(row=start_row, column=1, value=title).font = Font(bold=True, size=12)
-    start_row += 1
-
-    sanitized = [{k: _sanitize_for_excel(v) for k, v in row.items()} for row in rows]
-    df = pd.DataFrame(sanitized).reindex(columns=columns)
-
-    for r_idx, row in enumerate(
-        dataframe_to_rows(df, index=False, header=True), start=start_row
-    ):
-        for c_idx, val in enumerate(row, start=1):
-            cell = ws.cell(row=r_idx, column=c_idx, value=val)
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
-            if r_idx == start_row:
-                cell.font = Font(bold=True)
-
-    return start_row + len(df.index) + 2
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ORIGINAL build_workbook — UNCHANGED (backwards compat with /generate-bid-excel)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def build_workbook(
-    prompt1: Dict[str, Any], prompt2: Dict[str, Any], prompt3: Dict[str, Any]
-) -> bytes:
-    wb = Workbook()
-    wb.remove(wb.active)
-
-    if SPLIT_TABLES_TO_TABS:
-        _build_5_tabs(wb, prompt1, prompt2, prompt3)
-    else:
-        _build_3_tabs(wb, prompt1, prompt2, prompt3)
-
-    bio = BytesIO()
-    wb.save(bio)
-    return bio.getvalue()
-
-
-def _build_3_tabs(wb, p1, p2, p3):
-    ws1 = wb.create_sheet("01_Geotech_Table1")
-    r = _write_heading(ws1, p1.get("meta", {}))
-    t1 = p1.get("table1", {})
-    _write_table(
-        ws1, t1.get("title", "Table 1"), t1.get("columns", []), t1.get("rows", []), r
-    )
-    ws1.freeze_panes = "A4"
-    _autosize(ws1)
-
-    ws2 = wb.create_sheet("02_Concrete_Table2")
-    r = _write_heading(ws2, p2.get("meta", {}))
-    t2 = p2.get("table2", {})
-    _write_table(
-        ws2, t2.get("title", "Table 2"), t2.get("columns", []), t2.get("rows", []), r
-    )
-    ws2.freeze_panes = "A4"
-    _autosize(ws2)
-
-    ws3 = wb.create_sheet("03_Rebar_SI_SIP")
-    r = _write_heading(ws3, p3.get("meta", {}))
-    for key in ("table3", "table4", "table5"):
-        t = p3.get(key, {})
-        r = _write_table(
-            ws3, t.get("title", key), t.get("columns", []), t.get("rows", []), r
-        )
-    ws3.freeze_panes = "A4"
-    _autosize(ws3)
-
-
-def _build_5_tabs(wb, p1, p2, p3):
-    for sheet_name, src, key in [
-        ("Table1_Geotech", p1, "table1"),
-        ("Table2_Concrete", p2, "table2"),
-        ("Table3_Rebar", p3, "table3"),
-        ("Table4_Struct", p3, "table4"),
-        ("Table5_SIP", p3, "table5"),
-    ]:
-        ws = wb.create_sheet(sheet_name)
-        r = _write_heading(ws, src.get("meta", {}))
-        t = src.get(key, {})
-        _write_table(
-            ws, t.get("title", key), t.get("columns", []), t.get("rows", []), r
-        )
-        ws.freeze_panes = "A4"
-        _autosize(ws)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NEW HELPERS for build_workbook_v2 (branded, 10-tab)
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ─── Shared Helpers ───────────────────────────────────────────────────────────
 
 def _thin_border() -> Border:
     s = Side(style="thin", color=BORDER_C)
@@ -173,81 +34,95 @@ def _fmt(val: Any) -> str:
     if val is None:
         return ""
     if isinstance(val, list):
-        return "\n".join(f"• {_fmt(v)}" for v in val if v)
+        parts = [_fmt(v) for v in val if v not in (None, "", [])]
+        return "\n".join(f"• {p}" for p in parts) if parts else ""
     if isinstance(val, dict):
         return "\n".join(f"{k}: {_fmt(v)}" for k, v in val.items() if v)
     return str(val).strip()
 
 
-def _v2_title_block(ws: Worksheet, title: str, meta: Dict) -> int:
-    """Write branded title + meta. Returns next available row."""
-    # Navy title bar
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=12)
+def _autosize(ws: Worksheet, max_width: int = 60):
+    for col in ws.columns:
+        max_len = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            v = cell.value
+            if v:
+                max_len = max(max_len, len(str(v)))
+        ws.column_dimensions[col_letter].width = min(max(12, max_len + 2), max_width)
+
+
+# ─── Branded Title Block ──────────────────────────────────────────────────────
+
+def _title_block(ws: Worksheet, title: str, meta: Dict, n_cols: int = 13) -> int:
+    """Write navy title bar + orange accent + meta rows. Returns next available row."""
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
     c = ws.cell(row=1, column=1, value=title)
-    c.font = Font(bold=True, size=13, color=WHITE, name="Calibri")
-    c.fill = _hfill(NAVY)
+    c.font      = Font(bold=True, size=13, color=WHITE, name="Calibri")
+    c.fill      = _hfill(NAVY)
     c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     ws.row_dimensions[1].height = 28
 
-    # Orange accent strip
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=12)
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=n_cols)
     ws.cell(row=2, column=1).fill = _hfill(ORANGE)
-    ws.row_dimensions[2].height = 4
+    ws.row_dimensions[2].height  = 4
 
     row = 3
     for label, value in [
-        ("Project:", meta.get("project", "")),
-        ("Created By:", meta.get("created_by", "")),
-        ("Generated:", meta.get("generated_date", "")),
+        ("Project:",     meta.get("project", "")),
+        ("Created By:",  meta.get("created_by", "")),
+        ("Generated:",   meta.get("generated_date", "")),
     ]:
         if value:
             ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
-            ws.merge_cells(start_row=row, start_column=5, end_row=row, end_column=12)
+            ws.merge_cells(start_row=row, start_column=5, end_row=row, end_column=n_cols)
             lc = ws.cell(row=row, column=1, value=label)
-            vc = ws.cell(row=row, column=5, value=value)
+            vc = ws.cell(row=row, column=5, value=str(value))
             lc.font = Font(bold=True, size=10, color=NAVY, name="Calibri")
             vc.font = Font(size=10, name="Calibri")
-            lc.fill = vc.fill = _hfill("EEF1F5")
+            lc.fill = vc.fill = _hfill(SECTION_BG)
             lc.alignment = vc.alignment = Alignment(wrap_text=True, vertical="top")
             row += 1
 
-    return row + 1  # blank spacer
+    return row + 1  # blank spacer row
 
 
-def _v2_header_row(ws: Worksheet, columns: List[str], row: int):
+# ─── Header + Data Row Writers ───────────────────────────────────────────────
+
+def _header_row(ws: Worksheet, columns: List[str], row: int):
     for c, label in enumerate(columns, 1):
         cell = ws.cell(row=row, column=c, value=label)
-        cell.font = Font(bold=True, size=10, color=WHITE, name="Calibri")
-        cell.fill = _hfill(NAVY)
-        cell.alignment = Alignment(
-            horizontal="center", vertical="center", wrap_text=True
-        )
-        cell.border = _thin_border()
-    ws.row_dimensions[row].height = 20
+        cell.font      = Font(bold=True, size=10, color=WHITE, name="Calibri")
+        cell.fill      = _hfill(NAVY)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border    = _thin_border()
+    ws.row_dimensions[row].height = 22
 
 
-def _v2_data_rows(ws: Worksheet, columns: List[str], rows: List[Dict], start_row: int):
+def _data_rows(ws: Worksheet, columns: List[str], rows: List[Dict], start_row: int):
     for i, row_data in enumerate(rows):
-        r = start_row + i
+        r    = start_row + i
         fill = _hfill(ROW_LIGHT) if i % 2 == 0 else _hfill(WHITE)
         for c, col in enumerate(columns, 1):
-            val = row_data.get(col, "")
+            val  = row_data.get(col, "")
             cell = ws.cell(row=r, column=c, value=_fmt(val))
-            cell.font = Font(size=10, name="Calibri")
-            cell.fill = fill
+            cell.font      = Font(size=10, name="Calibri")
+            cell.fill      = fill
             cell.alignment = Alignment(wrap_text=True, vertical="top")
-            cell.border = _thin_border()
-        ws.row_dimensions[r].height = 55
+            cell.border    = _thin_border()
+        ws.row_dimensions[r].height = 60
 
 
-def _v2_write_sheet(ws: Worksheet, tbl: Dict, meta: Dict, col_widths: List[int] = None):
-    title = tbl.get("title", ws.title)
+def _write_table_block(ws: Worksheet, tbl: Dict, meta: Dict,
+                       col_widths: List[int] = None, n_cols: int = 13) -> int:
+    """Write a complete titled table on an existing sheet. Returns next row after table."""
+    title   = tbl.get("title", ws.title)
     columns = tbl.get("columns", [])
-    rows = tbl.get("rows", [])
+    rows    = tbl.get("rows", [])
 
-    hdr_row = _v2_title_block(ws, title, meta)
-    _v2_header_row(ws, columns, hdr_row)
-    _v2_data_rows(ws, columns, rows, hdr_row + 1)
+    hdr_row = _title_block(ws, title, meta, n_cols=n_cols)
+    _header_row(ws, columns, hdr_row)
+    _data_rows(ws, columns, rows, hdr_row + 1)
     ws.freeze_panes = ws.cell(row=hdr_row + 1, column=1).coordinate
 
     if col_widths:
@@ -256,131 +131,352 @@ def _v2_write_sheet(ws: Worksheet, tbl: Dict, meta: Dict, col_widths: List[int] 
     else:
         _autosize(ws)
 
+    return hdr_row + len(rows) + 2
 
-def _v2_write_table1(ws: Worksheet, tbl: Dict, header: Dict, meta: Dict):
-    """Table 1 gets an extra lot-size / flatwork info block."""
-    title = tbl.get("title", "Table 1 – Field Testing Requirements")
-    columns = tbl.get("columns", [])
-    rows = tbl.get("rows", [])
 
-    row = _v2_title_block(ws, title, meta)
+# ─── Cover Page Writer ────────────────────────────────────────────────────────
 
-    # Site info block
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=12)
-    c = ws.cell(row=row, column=1, value="PROJECT SITE INFORMATION")
-    c.font = Font(bold=True, size=10, color=WHITE, name="Calibri")
-    c.fill = _hfill(ORANGE)
+def _write_cover_page(ws: Worksheet, cover: Dict, meta: Dict):
+    n_cols = 8
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
+    c = ws.cell(row=1, column=1, value="Project Inspection and Testing Summary")
+    c.font      = Font(bold=True, size=16, color=WHITE, name="Calibri")
+    c.fill      = _hfill(NAVY)
     c.alignment = Alignment(horizontal="center", vertical="center")
-    row += 1
+    ws.row_dimensions[1].height = 40
 
-    lot = header.get("total_lot_size", {})
-    flat = header.get("total_flatwork", {})
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=n_cols)
+    ws.cell(row=2, column=1).fill = _hfill(ORANGE)
+    ws.row_dimensions[2].height  = 6
 
-    info_rows = [
-        (
-            "Total Lot Size",
-            f"{lot.get('value_sqft') or 'NOT SPECIFIED'}"
-            + (f"  ({lot.get('value_acres')} acres)" if lot.get("value_acres") else ""),
-        ),
-        ("Total Pavement Sqft", flat.get("total_pavement_sqft") or "NOT SPECIFIED"),
-        (
-            "Total Foundation Floor Sqft",
-            flat.get("total_foundation_floor_sqft") or "NOT SPECIFIED",
-        ),
-        ("Total Building Sqft", flat.get("total_building_sqft") or "NOT SPECIFIED"),
-        (
-            "Flatwork Exceeds Lot?",
-            (
-                "⚠ YES — " + str(flat.get("conflict_note", ""))
-                if flat.get("flatwork_exceeds_lot")
-                else "No"
-            ),
-        ),
-    ]
+    row = 3
 
-    for label, value in info_rows:
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
-        ws.merge_cells(start_row=row, start_column=4, end_row=row, end_column=12)
-        lc = ws.cell(row=row, column=1, value=label)
-        vc = ws.cell(row=row, column=4, value=str(value))
-        lc.font = Font(bold=True, size=10, color=NAVY, name="Calibri")
-        vc.font = Font(size=10, name="Calibri")
-        lc.fill = vc.fill = _hfill("EEF1F5")
-        lc.alignment = vc.alignment = Alignment(wrap_text=True, vertical="top")
+    def _section_header(label: str):
+        nonlocal row
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=n_cols)
+        c = ws.cell(row=row, column=1, value=label)
+        c.font      = Font(bold=True, size=11, color=WHITE, name="Calibri")
+        c.fill      = _hfill(ORANGE)
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[row].height = 20
         row += 1
 
-    row += 1  # spacer
+    def _info_row(label: str, value: str):
+        nonlocal row
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+        ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=n_cols)
+        lc = ws.cell(row=row, column=1, value=label)
+        vc = ws.cell(row=row, column=3, value=str(value or ""))
+        lc.font = Font(bold=True, size=10, color=NAVY, name="Calibri")
+        vc.font = Font(size=10, name="Calibri")
+        lc.fill = vc.fill = _hfill(SECTION_BG)
+        lc.alignment = vc.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[row].height = 18
+        row += 1
 
-    _v2_header_row(ws, columns, row)
-    _v2_data_rows(ws, columns, rows, row + 1)
-    ws.freeze_panes = ws.cell(row=row + 1, column=1).coordinate
+    # ── Prepared By ──
+    _section_header("PREPARED BY")
+    _info_row("Name",          cover.get("created_by", ""))
+    _info_row("Company",       cover.get("company", ""))
+    _info_row("Phone",         cover.get("phone", ""))
+    _info_row("Email",         cover.get("email", ""))
+    row += 1
 
-    widths = [22, 18, 14, 16, 16, 18, 28, 28, 28, 20]
+    # ── Project Information ──
+    _section_header("PROJECT INFORMATION")
+    _info_row("Project Name",    meta.get("project", ""))
+    _info_row("Project Address", cover.get("project_address", ""))
+    _info_row("County",          cover.get("county", ""))
+    _info_row("City",            cover.get("city", ""))
+    _info_row("Date Generated",  cover.get("date_run", meta.get("generated_date", "")))
+    row += 1
+
+    # ── Referenced Documents ──
+    _section_header("REFERENCED DOCUMENTS")
+    docs = cover.get("referenced_documents", [])
+    if docs:
+        for doc in docs:
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=n_cols)
+            c = ws.cell(row=row, column=1, value=f"• {doc}")
+            c.font      = Font(size=10, name="Calibri")
+            c.fill      = _hfill(ROW_LIGHT if row % 2 == 0 else WHITE)
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.row_dimensions[row].height = 18
+            row += 1
+    else:
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=n_cols)
+        ws.cell(row=row, column=1, value="No documents listed").font = Font(size=10, color="999999")
+        row += 1
+    row += 1
+
+    # ── Tables Generated ──
+    _section_header("TABLES GENERATED")
+    tables = cover.get("tables_generated", [
+        "Geotechnical Requirements",
+        "Flatwork/Foundation Requirements",
+        "Structural Requirements",
+        "Quantity Estimation",
+    ])
+    for t in tables:
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=n_cols)
+        c = ws.cell(row=row, column=1, value=f"• {t}")
+        c.font      = Font(size=10, name="Calibri")
+        c.fill      = _hfill(ROW_LIGHT if row % 2 == 0 else WHITE)
+        c.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[row].height = 18
+        row += 1
+
+    # Column widths
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 22
+    for i in range(3, n_cols + 1):
+        ws.column_dimensions[get_column_letter(i)].width = 18
+
+
+# ─── Quantity Estimation Writer ───────────────────────────────────────────────
+
+def _write_quantities(ws: Worksheet, qty: Dict, meta: Dict):
+    n_cols = 7
+    hdr_row = _title_block(ws, "Quantity Estimation", meta, n_cols=n_cols)
+
+    def _section_hdr(label: str) -> int:
+        nonlocal hdr_row
+        ws.merge_cells(start_row=hdr_row, start_column=1, end_row=hdr_row, end_column=n_cols)
+        c = ws.cell(row=hdr_row, column=1, value=label)
+        c.font      = Font(bold=True, size=11, color=WHITE, name="Calibri")
+        c.fill      = _hfill(ORANGE)
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[hdr_row].height = 20
+        hdr_row += 1
+        return hdr_row
+
+    def _kv(label: str, value: Any):
+        nonlocal hdr_row
+        ws.merge_cells(start_row=hdr_row, start_column=1, end_row=hdr_row, end_column=3)
+        ws.merge_cells(start_row=hdr_row, start_column=4, end_row=hdr_row, end_column=n_cols)
+        lc = ws.cell(row=hdr_row, column=1, value=label)
+        vc = ws.cell(row=hdr_row, column=4, value=_fmt(value))
+        lc.font = Font(bold=True, size=10, color=NAVY, name="Calibri")
+        vc.font = Font(size=10, name="Calibri")
+        lc.fill = vc.fill = _hfill(SECTION_BG if hdr_row % 2 == 0 else WHITE)
+        lc.alignment = vc.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[hdr_row].height = 22
+        hdr_row += 1
+
+    # ── Section A — Lot Size ──
+    _section_hdr("SECTION A — LOT SIZE")
+    lot = qty.get("section_a_lot_size", {})
+    _kv("Total Lot Size (sqft)",  lot.get("total_sqft"))
+    _kv("Total Lot Size (acres)", lot.get("total_acres"))
+    _kv("Source",                 lot.get("source"))
+    hdr_row += 1
+
+    # ── Section B — Foundations ──
+    _section_hdr("SECTION B — FOUNDATION CONSTRUCTION ELEMENTS")
+    foundations = qty.get("section_b_foundations", {})
+
+    drilled = foundations.get("drilled_shafts", [])
+    if drilled:
+        _kv("Drilled Shafts", f"{len(drilled)} group(s)")
+        for ds in drilled:
+            _kv(f"  Count × Depth", f"{ds.get('count','?')} shafts @ {ds.get('depth','?')}")
+
+    footings = foundations.get("spread_footings", [])
+    if footings:
+        _kv("Spread Footings", f"{len(footings)} size(s)")
+        for sf in footings:
+            label = sf.get("size_label", "")
+            val   = (f"{sf.get('count','?')} ea | "
+                     f"{sf.get('width','?')} × {sf.get('length','?')} × {sf.get('thickness','?')}")
+            _kv(f"  {label}", val)
+
+    lin = foundations.get("linear_footings", [])
+    if lin:
+        _kv("Linear Footings", f"{len(lin)} type(s)")
+        for lf in lin:
+            val = (f"{lf.get('count','?')} ea, L={lf.get('length','?')}, "
+                   f"W={lf.get('width','?')}, D={lf.get('depth','?')}")
+            _kv("  Linear Footing", val)
+
+    if foundations.get("conflicts"):
+        _kv("⚠ Conflicts", foundations["conflicts"])
+    hdr_row += 1
+
+    # ── Section C — Flatwork ──
+    _section_hdr("SECTION C — TOTAL FLATWORK CONSTRUCTION ELEMENTS")
+    flat = qty.get("section_c_flatwork", {})
+    _kv("Total Pavement (sqft)",         flat.get("total_pavement_sqft"))
+    _kv("Total Foundation Floor (sqft)", flat.get("total_foundation_floor_sqft"))
+    _kv("Total Building (sqft)",         flat.get("total_building_sqft"))
+    _kv("Source",                        flat.get("source"))
+    if flat.get("conflicts"):
+        _kv("⚠ Conflicts", flat["conflicts"])
+    hdr_row += 1
+
+    # ── Section D — Utilities ──
+    _section_hdr("SECTION D — TOTAL UTILITIES WORK")
+    util = qty.get("section_d_utilities", {})
+    _kv("Water Line (LF)",     util.get("water_line_lf"))
+    _kv("Storm Sewer (LF)",    util.get("storm_sewer_lf"))
+    _kv("Sanitary Sewer (LF)", util.get("sanitary_sewer_lf"))
+    _kv("Utility Depth",       util.get("utility_depth"))
+    _kv("Source",              util.get("source"))
+    hdr_row += 1
+
+    # ── Section E — Structural Elements ──
+    _section_hdr("SECTION E — TOTAL STRUCTURAL ELEMENTS")
+    s_cols = ["Structural Element", "Material Type", "Quantity", "Unit",
+              "Calculation Basis", "Source"]
+    _header_row(ws, s_cols, hdr_row)
+    hdr_row += 1
+
+    struct_items = qty.get("section_e_structural", [])
+    col_map = {
+        "Structural Element": "structural_element",
+        "Material Type":      "material_type",
+        "Quantity":           "quantity",
+        "Unit":               "unit",
+        "Calculation Basis":  "calculation_basis",
+        "Source":             "source",
+    }
+    for i, item in enumerate(struct_items):
+        fill = _hfill(ROW_LIGHT) if i % 2 == 0 else _hfill(WHITE)
+        for c, col in enumerate(s_cols, 1):
+            val  = item.get(col_map[col], "")
+            cell = ws.cell(row=hdr_row, column=c, value=_fmt(val))
+            cell.font      = Font(size=10, name="Calibri")
+            cell.fill      = fill
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+            cell.border    = _thin_border()
+        ws.row_dimensions[hdr_row].height = 40
+        hdr_row += 1
+
+    # Conflicts
+    conflicts = qty.get("conflicts", [])
+    if conflicts:
+        hdr_row += 1
+        _section_hdr("CONFLICTS / VALIDATION ISSUES")
+        for conflict in conflicts:
+            ws.merge_cells(start_row=hdr_row, start_column=1, end_row=hdr_row, end_column=n_cols)
+            c = ws.cell(row=hdr_row, column=1, value=f"⚠ {conflict}")
+            c.font      = Font(size=10, color="CC0000", name="Calibri")
+            c.fill      = _hfill("FFF3F3")
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.row_dimensions[hdr_row].height = 30
+            hdr_row += 1
+
+    # Column widths
+    widths = [28, 20, 14, 14, 30, 24, 18]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW build_workbook_v2 — 10-tab branded workbook
+# build_workbook_v2 — 6-tab branded workbook (Herman's spec)
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 def build_workbook_v2(all_tables: Dict[str, Any]) -> bytes:
     """
-    Builds a branded 10-sheet workbook from the merged extraction dict.
-    Expected keys: meta, header, table1 … table10, assumptions_or_gaps
+    Builds a branded workbook per Herman's spec:
+    Cover Page → T1 Geotech → T2 Flatwork-Foundation → T3 Structural → Quantities → Gaps
     """
     wb = Workbook()
     wb.remove(wb.active)
 
-    meta = all_tables.get("meta", {})
+    meta   = all_tables.get("meta", {})
     header = all_tables.get("header", {})
+    cover  = all_tables.get("cover_page", {})
 
-    SHEETS = [
-        # (tab_name,              dict_key,   col_widths or None)
-        ("T1 – Geotech", "table1", None),  # special writer
-        ("T2 – Concrete", "table2", [22, 12, 16, 14, 12, 12, 20, 12, 12, 12, 24, 16]),
-        ("T3 – Rebar", "table3", [22, 10, 18, 20, 28, 16]),
-        ("T4 – Structural", "table4", [28, 12, 40, 16]),
-        ("T5 – SIP", "table5", [24, 32, 28, 16]),
-        ("T6 – Masonry", "table6", [22, 14, 12, 12, 18, 18, 22, 16, 18, 24, 16]),
-        ("T7 – Earthwork", "table7", [24, 18, 24, 22, 22, 18, 16]),
-        ("T8 – Utilities", "table8", [22, 18, 14, 18, 18, 18, 16, 18, 24, 16]),
-        ("T9 – Inspections", "table9", [20, 24, 16, 16, 22, 18, 16, 16]),
-        ("T10 – Summary", "table10", [34, 12, 16, 24, 24, 16]),
-    ]
+    # ── Tab 1: Cover Page ──
+    ws_cover = wb.create_sheet("Cover Page")
+    _write_cover_page(ws_cover, cover, meta)
 
-    for tab_name, key, widths in SHEETS:
-        ws = wb.create_sheet(tab_name)
-        tbl = all_tables.get(key) or {
-            "title": tab_name,
-            "columns": ["Note"],
-            "rows": [{"Note": "No data extracted for this table."}],
-        }
+    # ── Tab 2: T1 Geotech ──
+    ws1 = wb.create_sheet("T1 – Geotech")
+    tbl1 = all_tables.get("table1") or {
+        "title": "Table 1 – Geotechnical Technical Requirements",
+        "columns": ["Note"],
+        "rows": [{"Note": "No data extracted."}],
+    }
+    # Add project site info block above table
+    n_cols1 = 11
+    row = _title_block(ws1, tbl1.get("title", "Table 1"), meta, n_cols=n_cols1)
 
-        if key == "table1":
-            _v2_write_table1(ws, tbl, header, meta)
-        else:
-            _v2_write_sheet(ws, tbl, meta, col_widths=widths)
+    if header:
+        ws1.merge_cells(start_row=row, start_column=1, end_row=row, end_column=n_cols1)
+        sh = ws1.cell(row=row, column=1, value="PROJECT SITE INFORMATION")
+        sh.font      = Font(bold=True, size=10, color=WHITE, name="Calibri")
+        sh.fill      = _hfill(ORANGE)
+        sh.alignment = Alignment(horizontal="center", vertical="center")
+        row += 1
+        for label, value in [
+            ("Project Address", header.get("project_address", "")),
+            ("County",          header.get("county", "")),
+            ("City",            header.get("city", "")),
+            ("Referenced Docs", ", ".join(header.get("referenced_documents", []))),
+        ]:
+            ws1.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
+            ws1.merge_cells(start_row=row, start_column=4, end_row=row, end_column=n_cols1)
+            lc = ws1.cell(row=row, column=1, value=label)
+            vc = ws1.cell(row=row, column=4, value=str(value or ""))
+            lc.font = Font(bold=True, size=10, color=NAVY, name="Calibri")
+            vc.font = Font(size=10, name="Calibri")
+            lc.fill = vc.fill = _hfill(SECTION_BG)
+            lc.alignment = vc.alignment = Alignment(wrap_text=True, vertical="top")
+            ws1.row_dimensions[row].height = 18
+            row += 1
+        row += 1
 
-    # Gaps & Assumptions tab
+    _header_row(ws1, tbl1.get("columns", []), row)
+    _data_rows(ws1, tbl1.get("columns", []), tbl1.get("rows", []), row + 1)
+    ws1.freeze_panes = ws1.cell(row=row + 1, column=1).coordinate
+    for i, w in enumerate([22, 18, 20, 14, 16, 16, 18, 28, 28, 28, 20], 1):
+        ws1.column_dimensions[get_column_letter(i)].width = w
+
+    # ── Tab 3: T2 Flatwork-Foundation ──
+    ws2 = wb.create_sheet("T2 – Flatwork-Foundation")
+    tbl2 = all_tables.get("table2") or {
+        "title": "Table 2 – Flatwork/Foundation Technical Requirements",
+        "columns": ["Note"],
+        "rows": [{"Note": "No data extracted."}],
+    }
+    _write_table_block(ws2, tbl2, meta,
+                       col_widths=[22, 16, 14, 12, 14, 16, 16, 16, 28, 20, 20, 24, 20],
+                       n_cols=13)
+
+    # ── Tab 4: T3 Structural ──
+    ws3 = wb.create_sheet("T3 – Structural")
+    tbl3 = all_tables.get("table3") or {
+        "title": "Table 3 – Structural Technical Requirements",
+        "columns": ["Note"],
+        "rows": [{"Note": "No data extracted."}],
+    }
+    _write_table_block(ws3, tbl3, meta,
+                       col_widths=[24, 18, 20, 24, 20, 28, 22],
+                       n_cols=7)
+
+    # ── Tab 5: Quantity Estimation ──
+    ws_qty = wb.create_sheet("Quantity Estimation")
+    _write_quantities(ws_qty, all_tables.get("quantity_estimation", {}), meta)
+
+    # ── Tab 6: Gaps & Assumptions ──
     gaps = all_tables.get("assumptions_or_gaps") or []
     if gaps:
         ws_g = wb.create_sheet("Gaps & Assumptions")
-        ws_g.merge_cells("A1:C1")
+        ws_g.merge_cells("A1:D1")
         c = ws_g["A1"]
-        c.value = "Assumptions & Gaps Identified by AI"
-        c.font = Font(bold=True, size=12, color=WHITE, name="Calibri")
-        c.fill = _hfill(NAVY)
+        c.value     = "Assumptions & Gaps Identified by AI"
+        c.font      = Font(bold=True, size=12, color=WHITE, name="Calibri")
+        c.fill      = _hfill(NAVY)
         c.alignment = Alignment(horizontal="center", vertical="center")
         ws_g.row_dimensions[1].height = 26
         for i, note in enumerate(gaps, 2):
             cell = ws_g.cell(row=i, column=1, value=f"• {note}")
-            cell.font = Font(size=10, name="Calibri")
+            cell.font      = Font(size=10, name="Calibri")
             cell.alignment = Alignment(wrap_text=True, vertical="top")
-            cell.fill = _hfill(ROW_LIGHT if i % 2 == 0 else WHITE)
+            cell.fill      = _hfill(ROW_LIGHT if i % 2 == 0 else WHITE)
             ws_g.row_dimensions[i].height = 40
-        ws_g.column_dimensions["A"].width = 100
+        ws_g.column_dimensions["A"].width = 120
 
     wb.active = wb.worksheets[0]
     bio = BytesIO()
