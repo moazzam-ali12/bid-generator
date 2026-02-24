@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import asyncio
 from typing import List, Dict, Any
 
@@ -102,6 +103,33 @@ def _maybe_filter(
     return out
 
 
+# ─── JSON Cleaner ─────────────────────────────────────────────────────────────
+
+def _clean_json(raw: str) -> str:
+    """
+    Strip markdown fences and any leading/trailing noise GPT adds
+    despite being told not to. Handles all common cases:
+      - ```json ... ```
+      - ``` ... ```
+      - Explanation text before the first { or [
+      - Trailing text after the last } or ]
+    """
+    text = raw.strip()
+    # Remove opening fence
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    # Remove closing fence
+    text = re.sub(r"\s*```$", "", text)
+    # Find first JSON character
+    match = re.search(r"[\[\{]", text)
+    if match:
+        text = text[match.start():]
+    # Trim trailing noise after last } or ]
+    last = max(text.rfind("}"), text.rfind("]"))
+    if last != -1:
+        text = text[:last + 1]
+    return text.strip()
+
+
 # ─── JSON Parse + Retry ───────────────────────────────────────────────────────
 
 async def _parse_json_or_retry_async(
@@ -112,28 +140,30 @@ async def _parse_json_or_retry_async(
 ) -> Dict[str, Any]:
     last = None
     for attempt in range(retries + 1):
-        raw = await asyncio.to_thread(client.chat_json, system=system, user=user)
+        raw  = await asyncio.to_thread(client.chat_json, system=system, user=user)
         last = raw
         try:
-            return json.loads(raw)
+            return json.loads(_clean_json(raw))
         except Exception:
             if attempt >= retries:
                 raise HTTPException(
                     status_code=502,
-                    detail=f"Model did not return valid JSON. Last response: {raw[:2000]}",
+                    detail=f"Model did not return valid JSON after {retries + 1} attempts. "
+                           f"Last response: {raw[:500]}",
                 )
             user = (
                 "Your previous response was not valid JSON.\n"
-                "Return ONLY valid JSON that matches the schema. No markdown. No extra keys.\n\n"
+                "Return ONLY valid JSON that matches the schema exactly.\n"
+                "No markdown. No backticks. No explanation. Start with { or [.\n\n"
                 + user
             )
     raise HTTPException(
         status_code=502,
-        detail=f"Model did not return valid JSON. Last response: {str(last)[:2000]}",
+        detail=f"JSON parse failed. Last response: {str(last)[:500]}",
     )
 
 
-# ─── Pydantic model for chat refinement ──────────────────────────────────────
+# ─── Pydantic models ─────────────────────────────────────────────────────────
 
 class RefinementMessage(BaseModel):
     role: str
@@ -237,24 +267,21 @@ async def generate_bid_excel_v2(
     doc_list     = [d.filename for d in docs_full]
     client       = OpenAIClient(cfg)
     full_context = build_context(
-        _maybe_filter(docs_full, [], disable_filter)  # full text, no keyword filter for v2
+        _maybe_filter(docs_full, [], disable_filter)
     )
 
-    # Build all 5 prompts
     p1 = prompt_1_table1(project_name, doc_list)
     p2 = prompt_2_table2(project_name, doc_list)
     p3 = prompt_3_tables3_4_5(project_name, doc_list)
     p4 = prompt_4_tables6_7(project_name, doc_list)
     p5 = prompt_5_tables8_9_10(project_name, doc_list)
 
-    # Append full document context to each prompt
     u1 = p1["user"] + "\n" + full_context
     u2 = p2["user"] + "\n" + full_context
     u3 = p3["user"] + "\n" + full_context
     u4 = p4["user"] + "\n" + full_context
     u5 = p5["user"] + "\n" + full_context
 
-    # Run all 5 prompts in parallel
     print("Starting parallel extraction for all 10 tables...")
     out1, out2, out3, out4, out5 = await asyncio.gather(
         _parse_json_or_retry_async(client, p1["system"], u1, retries=1),
@@ -265,7 +292,6 @@ async def generate_bid_excel_v2(
     )
     print("All 10 tables extracted successfully!")
 
-    # Merge all outputs
     all_tables = {
         "meta":    out1.get("meta",    {}),
         "header":  out1.get("header",  {}),
@@ -293,7 +319,7 @@ async def generate_bid_excel_v2(
 
     return {
         "extraction":       all_tables,
-        "document_context": full_context[:30000],  # capped for chat refinement turns
+        "document_context": full_context[:30000],
         "excel_base64":     base64.b64encode(xlsx_bytes).decode(),
         "filename":         filename,
     }
@@ -303,10 +329,6 @@ async def generate_bid_excel_v2(
 
 @app.post("/refine-extraction")
 async def refine_extraction(req: RefineRequest):
-    """
-    Conversational refinement — up to MAX_REFINEMENTS turns.
-    UI tracks turn count and blocks further calls after limit.
-    """
     user_turns = sum(1 for m in req.conversation_history if m.role == "user")
     if user_turns >= MAX_REFINEMENTS:
         raise HTTPException(
@@ -322,38 +344,51 @@ async def refine_extraction(req: RefineRequest):
     client = OpenAIClient(cfg)
 
     system = f"""You are an expert construction document analyst helping refine a bid extraction.
-You have already extracted data from project documents into a structured JSON.
 The user will give you specific correction instructions.
-Return the COMPLETE updated JSON with corrections applied.
-Return ONLY valid JSON. No markdown fences. No explanation outside the JSON.
+Apply the corrections to the current extraction JSON and return the COMPLETE updated JSON.
+
+CRITICAL: Return ONLY valid JSON. No markdown. No backticks. No explanation.
+Start your response with {{ and end with }}.
 
 Current extraction:
-{json.dumps(req.current_extraction, indent=2)}
+{json.dumps(req.current_extraction, indent=2)[:12000]}
 
 Document context (for reference):
-{req.document_context[:15000]}
+{req.document_context[:10000]}
 """
 
-    # Flatten conversation history into a single user message
     history_text = "\n\n".join(
         f"[{m.role.upper()}]: {m.content}" for m in req.conversation_history
     )
-    flat_user = history_text + f"\n\n[USER]: {req.user_message}"
+    flat_user = (history_text + f"\n\n[USER]: {req.user_message}").strip()
 
+    # First attempt
     raw = await asyncio.to_thread(client.chat_json, system=system, user=flat_user)
     try:
-        updated = json.loads(raw)
+        updated = json.loads(_clean_json(raw))
     except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=502,
-            detail="Model returned invalid JSON during refinement.",
+        # One automatic retry with stronger instruction
+        retry_user = (
+            "Your response was not valid JSON. "
+            "Return ONLY the JSON object. No markdown. No explanation. "
+            "Start with { and end with }.\n\n"
+            + flat_user
         )
+        raw2 = await asyncio.to_thread(client.chat_json, system=system, user=retry_user)
+        try:
+            updated = json.loads(_clean_json(raw2))
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Model returned invalid JSON during refinement. "
+                       f"Response preview: {raw2[:300]}",
+            )
 
     xlsx_bytes = build_workbook_v2(updated)
 
     return {
-        "extraction":           updated,
-        "excel_base64":         base64.b64encode(xlsx_bytes).decode(),
-        "refinements_used":     user_turns + 1,
+        "extraction":            updated,
+        "excel_base64":          base64.b64encode(xlsx_bytes).decode(),
+        "refinements_used":      user_turns + 1,
         "refinements_remaining": MAX_REFINEMENTS - (user_turns + 1),
     }
